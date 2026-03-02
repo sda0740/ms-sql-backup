@@ -1,0 +1,97 @@
+@echo off
+setlocal enableextensions
+rem ====== 운영서버 DB > 백업서버에 백업 bat file =======
+rem ====== 설정 ======
+set "SHARE=\\db14\F$"
+set "SRC=\\db14\F$\DB_BACKUP\DataFiles"
+set "DEST=G:\Backups\From14\DataFiles"
+set "LOGDIR=G:\Backups\Logs"
+set "DEBUGLOG=%LOGDIR%\copy_debug.log"
+set "THREADS=16"
+set "RETRIES=2"
+set "WAIT=5"
+set "RETAIN_DAYS=30"   rem 로그 보관일수 (백업 파일 보관은 아래 forfiles에서 2일로 설정)
+
+set "RUSER=" rem 아이디 채우기
+set "RPASS=" rem 비밀번호 채우기 
+set "USE_NAME_FILTER=1"   rem 1=파일명 yyyy_MM_dd, 0=수정일 필터
+
+rem ====== 준비 ======
+if not exist "%DEST%"  mkdir "%DEST%"
+if not exist "%LOGDIR%" mkdir "%LOGDIR%"
+
+>>"%DEBUGLOG%" echo ===============================
+>>"%DEBUGLOG%" echo [START] %date% %time%
+>>"%DEBUGLOG%" echo ===============================
+
+rem 기존 세션 정리(충돌 방지)
+net use * /delete /y >>"%DEBUGLOG%" 2>&1
+
+for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString('yyyyMMdd')"') do set "TDAY=%%i"
+for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString('yyyy_MM_dd')"') do set "TDAYU=%%i"
+
+rem ====== 공유 연결 ======
+>>"%DEBUGLOG%" echo [STEP] Connecting to %SHARE%...
+net use "%SHARE%" /user:%RUSER% "%RPASS%" >>"%DEBUGLOG%" 2>&1
+set "RCNET=%ERRORLEVEL%"
+>>"%DEBUGLOG%" echo NET USE RC=%RCNET%
+if not "%RCNET%"=="0" (
+  >>"%DEBUGLOG%" echo [ERROR] NET USE failed. Check creds/admin-share/policies.
+  set "RC=9"
+  goto :CLEANUP
+)
+
+rem ====== 2일 이상 지난 백업(.bak/.trn) 삭제 (DEST ONLY) ======
+>>"%DEBUGLOG%" echo [STEP] Delete backup files older than 2 days in %DEST%...
+forfiles /p "%DEST%" /s /m *.bak /d -2 /c "cmd /c del @file" >>"%DEBUGLOG%" 2>&1
+forfiles /p "%DEST%" /s /m *.trn /d -2 /c "cmd /c del @file" >>"%DEBUGLOG%" 2>&1
+
+rem ====== 복사 수행 ======
+>>"%DEBUGLOG%" echo [STEP] Starting robocopy...
+if "%USE_NAME_FILTER%"=="1" (
+  >>"%DEBUGLOG%" echo [INFO] Pattern: *%TDAYU%*.bak *%TDAYU%*.trn
+  robocopy "%SRC%" "%DEST%" *%TDAYU%*.bak *%TDAYU%*.trn /S /FFT /COPY:DAT /DCOPY:T ^
+    /R:%RETRIES% /W:%WAIT% /MT:%THREADS% /NP ^
+    /LOG+:"%LOGDIR%\copy_today_byname_%TDAY%.log" >>"%DEBUGLOG%" 2>&1
+) else (
+  >>"%DEBUGLOG%" echo [INFO] MIN/MAXAGE: %TDAY%
+  robocopy "%SRC%" "%DEST%" *.bak *.trn /S /FFT /COPY:DAT /DCOPY:T ^
+    /R:%RETRIES% /W:%WAIT% /MT:%THREADS% /NP ^
+    /MINAGE:%TDAY% /MAXAGE:%TDAY% ^
+    /LOG+:"%LOGDIR%\copy_today_%TDAY%.log" >>"%DEBUGLOG%" 2>&1
+)
+set "RC=%ERRORLEVEL%"
+>>"%DEBUGLOG%" echo ROBOCOPY RC=%RC%
+
+rem ====== 타임스탬프(수정일) 교정 ======
+>>"%DEBUGLOG%" echo [STEP] PowerShell timestamp fix...
+powershell -NoProfile -Command ^
+  "$src='\\\\db14\\F$\\DB_BACKUP\\DataFiles';" ^
+  "$dst='G:\\Backups\\From14\\DataFiles';" ^
+  "$tag=(Get-Date).ToString('yyyy_MM_dd');" ^
+  "Get-ChildItem -Path $dst -Filter \"*$tag*.*\" -File | ForEach-Object {" ^
+  "  $sf=Join-Path $src $_.Name;" ^
+  "  if (Test-Path $sf) {" ^
+  "    $t=(Get-Item $sf).LastWriteTime;" ^
+  "    (Get-Item $_.FullName).LastWriteTime=$t;" ^
+  "  }" ^
+  "}" >>"%DEBUGLOG%" 2>&1
+ 
+
+:CLEANUP
+rem ====== 정리 ======
+>>"%DEBUGLOG%" echo [STEP] Cleaning up...
+forfiles /p "%LOGDIR%" /m *.log /d -%RETAIN_DAYS% /c "cmd /c del @file" >>"%DEBUGLOG%" 2>&1
+net use "%SHARE%" /delete >>"%DEBUGLOG%" 2>&1
+
+if not defined RC set "RC=0"
+if %RC% LEQ 1 (
+  >>"%DEBUGLOG%" echo [OK] Finished RC=%RC%
+) else (
+  >>"%DEBUGLOG%" echo [WARN] Finished RC=%RC% (check logs)
+)
+
+>>"%DEBUGLOG%" echo [END] %date% %time%
+>>"%DEBUGLOG%" echo ===============================
+
+endlocal & exit /b %RC%
